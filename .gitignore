@@ -1,0 +1,34 @@
+# Environment
+backend/config/.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv
+*.egg-info/
+.pytest_cache/
+
+# Data
+data/historical/*.csv
+data/*.db
+data/backtest_trades.csv
+logs/
+
+# Node
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code
+.claude/cache/

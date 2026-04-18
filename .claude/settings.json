@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(pytest *)",
+      "Bash(pip install *)",
+      "Bash(docker compose *)",
+      "Bash(docker *)",
+      "Bash(npm *)",
+      "Bash(node *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(curl -s https://api.binance.com/*)",
+      "Bash(curl -s https://fapi.binance.com/*)",
+      "Bash(curl -s https://testnet.binancefuture.com/*)",
+      "Read(./**)",
+      "Write(./backend/**)",
+      "Write(./dashboard/**)",
+      "Write(./*.md)",
+      "Edit(./backend/**)",
+      "Edit(./dashboard/**)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push *)",
+      "Bash(git commit *)",
+      "Write(./backend/config/.env)",
+      "Read(./backend/config/.env)",
+      "Edit(./backend/config/.env)",
+      "Bash(curl *api.binance.com/api/v3/account*)",
+      "Bash(* --api-key *)",
+      "Bash(* --api-secret *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "paths": ["backend/config/settings.py"],
+        "message": "⚠️ You're editing core config. Verify the change doesn't disable safety features (dry_run, kill_switch, max_leverage)."
+      }
+    ]
+  }
+}
