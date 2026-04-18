@@ -18,16 +18,24 @@ from modules.schemas import (
 from modules.cattrade_scraper import CattradeSignal
 from config.settings import config
 
+# BTCBiasAnalyzer import (optional – injected at runtime)
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from modules.btc_bias_analyzer import BTCBiasAnalyzer
+
 
 logger = logging.getLogger(__name__)
 
 
 class SignalAggregator:
-    def __init__(self):
+    def __init__(self, btc_bias_analyzer=None):
         self.oi_cfg = config.oi_scanner
         self.risk_cfg = config.risk
+        self.bias_cfg = config.btc_bias
         self._recent_signals: dict[str, datetime] = {}  # symbol → last signal time
         self._cooldown_minutes = 30
+        # BTCBiasAnalyzer instance (injected từ main.py)
+        self._btc_bias = btc_bias_analyzer
     
     def _base_symbol(self, pair_symbol: str) -> str:
         return pair_symbol.replace("USDT", "")
@@ -108,6 +116,24 @@ class SignalAggregator:
             # Market share anomaly
             if cattrade.market_share_score >= 20:
                 score += 1
+
+        # ── BTCBias (Smart Money) ──
+        # Chỉ áp dụng cho BTC signals (BTCUSDT / XBTUSD) hoặc dùng như market regime filter
+        if self._btc_bias and self.bias_cfg.enabled:
+            bias = self._btc_bias.get_bias()
+            if bias.is_fresh and bias.direction != "NEUTRAL":
+                signal_dir_str = "LONG" if divergence.direction == Side.LONG else "SHORT"
+                delta = self._btc_bias.get_score_delta(signal_dir_str)
+
+                # Chỉ áp dụng delta nếu đủ confidence ngưỡng
+                same = (
+                    (signal_dir_str == "LONG"  and bias.direction == "BULLISH") or
+                    (signal_dir_str == "SHORT" and bias.direction == "BEARISH")
+                )
+                if same and bias.confidence >= self.bias_cfg.min_confidence_to_boost:
+                    score += min(delta, self.bias_cfg.max_score_delta)
+                elif not same and bias.confidence >= self.bias_cfg.min_confidence_to_suppress:
+                    score += max(delta, -self.bias_cfg.max_score_delta)
 
         if score >= 7:
             return SignalStrength.STRONG, score

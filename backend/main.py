@@ -31,6 +31,7 @@ from modules.nlp_sentiment import NLPSentimentAnalyzer
 from modules.signal_aggregator import SignalAggregator
 from modules.cattrade_scraper import CattradeScraper, CattradeSignal
 from modules.new_listing_scanner import NewListingScanner
+from modules.btc_bias_analyzer import BTCBiasAnalyzer
 from modules.schemas import NewListingSetup
 from modules.risk_manager import RiskManager
 from modules.price_streamer import PriceStreamer
@@ -72,7 +73,7 @@ class Bot:
         self.oi_scanner = OIScanner(self.client)
         self.sentiment = SentimentScraper()
         self.nlp = NLPSentimentAnalyzer()
-        self.aggregator = SignalAggregator()
+        self.aggregator = SignalAggregator()  # placeholder, replaced after btc_bias init below
         self.risk = RiskManager(self.client)
         self.executor = Executor(self.client)
         self.tracker = PositionTracker(self.client, self.executor)
@@ -81,6 +82,9 @@ class Bot:
         
         self.cattrade = CattradeScraper()
         self.new_listing_scanner = NewListingScanner(self.client)
+        self.btc_bias = BTCBiasAnalyzer()
+        # Overwrite placeholder aggregator với BTCBias injected
+        self.aggregator = SignalAggregator(btc_bias_analyzer=self.btc_bias)
         self.latest_divergences: list[OIDivergence] = []
         self.latest_sentiments: dict[str, SentimentScore] = {}
         self.latest_cattrades: dict[str, CattradeSignal] = {}
@@ -305,6 +309,7 @@ class Bot:
                 price_streamer=self.price_streamer,
             ),
             self._monitor_new_listing_setups(),
+            self.btc_bias.run_forever(),
         )
     
     async def shutdown(self):
@@ -428,7 +433,25 @@ async def datasources():
             "testnet": config.binance.testnet,
             "dry_run": config.executor.dry_run,
         },
+        "btc_bias": bot.btc_bias.get_status(),
     })
+
+
+@app.get("/api/btc-bias")
+async def btc_bias():
+    """
+    Smart Money BTC bias từ Paul Wei's account (BitMEX Hall of Legends, 52x return).
+    Data source: github.com/bwjoke/BTC-Trading-Since-2020 (cập nhật daily)
+    """
+    b = bot.btc_bias.get_bias()
+    return safe_json(b.to_dict())
+
+
+@app.post("/api/btc-bias/refresh")
+async def btc_bias_refresh():
+    """Force refresh BTCBias từ GitHub."""
+    b = await bot.btc_bias.refresh()
+    return safe_json(b.to_dict())
 
 
 @app.get("/api/cattrade")

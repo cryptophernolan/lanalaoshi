@@ -687,6 +687,143 @@ function SourceRow({ name, src }) {
   );
 }
 
+// ============ BTC BIAS PANEL ============
+function BTCBiasPanel({ bias }) {
+  if (!bias) return (
+    <Panel title="Smart Money Bias" subtitle="Paul Wei · @coolish · BitMEX Hall of Legends" accent="#a855f7">
+      <div style={{ padding: 24, color: theme.textFaint, fontSize: 12, fontFamily: theme.mono }}>
+        Fetching data from github.com/bwjoke/BTC-Trading-Since-2020…
+      </div>
+    </Panel>
+  );
+
+  const dirColor = bias.direction === "BULLISH" ? theme.green
+    : bias.direction === "BEARISH" ? theme.red
+    : theme.textDim;
+
+  const dirEmoji = bias.direction === "BULLISH" ? "🟢" : bias.direction === "BEARISH" ? "🔴" : "⚪";
+  const regimeColor = bias.regime === "BULL" ? theme.green : bias.regime === "BEAR" ? theme.red : theme.yellow;
+
+  const confPct = ((bias.confidence || 0) * 100).toFixed(0);
+  const isShort = bias.position_qty < 0;
+
+  const subtitle = `52x return · ${bias.account_multiple?.toFixed(1)}x adjusted multiple · ${bias.data_date || "—"}`;
+
+  return (
+    <Panel title="Smart Money Bias · Paul Wei @coolish" subtitle={subtitle} accent="#a855f7">
+      <div style={{ display: "flex", gap: 0 }}>
+
+        {/* Left: main signal */}
+        <div style={{
+          flex: "0 0 220px",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+          padding: "20px 16px", borderRight: `1px solid ${theme.border}`,
+          background: `rgba(${bias.direction==="BEARISH"?"239,68,68":bias.direction==="BULLISH"?"34,197,94":"100,100,100"},0.04)`,
+        }}>
+          <div style={{ fontSize: 36, marginBottom: 4 }}>{dirEmoji}</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: dirColor, fontFamily: theme.display, letterSpacing: 1 }}>
+            {bias.direction}
+          </div>
+          <div style={{ fontSize: 11, color: theme.textDim, fontFamily: theme.mono, marginTop: 4 }}>
+            CONFIDENCE
+          </div>
+          <div style={{ fontSize: 28, fontWeight: 700, color: dirColor, fontFamily: theme.mono }}>
+            {confPct}%
+          </div>
+          {/* Confidence bar */}
+          <div style={{ width: "100%", height: 4, background: theme.border, borderRadius: 2, marginTop: 8 }}>
+            <div style={{
+              width: `${confPct}%`, height: "100%", borderRadius: 2,
+              background: dirColor, transition: "width 0.4s ease",
+            }}/>
+          </div>
+        </div>
+
+        {/* Middle: position details */}
+        <div style={{ flex: 1, padding: "12px 16px", borderRight: `1px solid ${theme.border}` }}>
+          <div style={{ fontSize: 10, color: theme.textFaint, fontFamily: theme.mono, marginBottom: 8, letterSpacing: 1 }}>
+            CURRENT POSITION — XBTUSD (BitMEX)
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 16px" }}>
+            {[
+              ["Direction", isShort ? "SHORT" : bias.position_qty > 0 ? "LONG" : "FLAT",
+               isShort ? theme.red : bias.position_qty > 0 ? theme.green : theme.textDim],
+              ["Qty", bias.position_qty != null ? bias.position_qty.toLocaleString() : "—", dirColor],
+              ["Avg Entry", bias.avg_entry_price ? `$${bias.avg_entry_price.toLocaleString()}` : "—", theme.text],
+              ["Mark Price", bias.mark_price ? `$${bias.mark_price.toLocaleString()}` : "—", theme.text],
+              ["Unrealized PnL", bias.unrealized_pnl_pct != null
+                ? `${bias.unrealized_pnl_pct >= 0 ? "+" : ""}${bias.unrealized_pnl_pct.toFixed(2)}%`
+                : "—",
+               pnlColor(bias.unrealized_pnl_pct)],
+              ["Leverage", bias.leverage ? `${bias.leverage}x` : "—", theme.amber],
+            ].map(([label, value, color]) => (
+              <div key={label}>
+                <div style={{ fontSize: 9, color: theme.textFaint, fontFamily: theme.mono, letterSpacing: 0.5 }}>{label}</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: color || theme.text, fontFamily: theme.mono }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          {bias.key_level && (
+            <div style={{
+              marginTop: 10, padding: "5px 10px", borderRadius: 4,
+              background: "rgba(168,85,247,0.1)", border: "1px solid rgba(168,85,247,0.3)",
+              fontSize: 11, fontFamily: theme.mono, color: "#a855f7",
+            }}>
+              🎯 Key Level: <strong>${bias.key_level.toLocaleString()}</strong>
+              {" "}(Paul Wei avg entry — watch for reaction)
+            </div>
+          )}
+        </div>
+
+        {/* Right: market regime + equity stats */}
+        <div style={{ flex: "0 0 180px", padding: "12px 16px" }}>
+          <div style={{ fontSize: 10, color: theme.textFaint, fontFamily: theme.mono, marginBottom: 8, letterSpacing: 1 }}>
+            MARKET REGIME
+          </div>
+          <div style={{
+            fontSize: 16, fontWeight: 700, color: regimeColor, fontFamily: theme.display,
+            marginBottom: 14, letterSpacing: 1,
+          }}>
+            {bias.regime || "—"}
+          </div>
+
+          <div style={{ fontSize: 10, color: theme.textFaint, fontFamily: theme.mono, marginBottom: 6, letterSpacing: 1 }}>
+            EQUITY CURVE (XBT)
+          </div>
+          {[
+            ["7d change", bias.equity_7d_pct != null
+              ? `${bias.equity_7d_pct >= 0 ? "+" : ""}${bias.equity_7d_pct.toFixed(2)}%`
+              : "—", pnlColor(bias.equity_7d_pct)],
+            ["30d change", bias.equity_30d_pct != null
+              ? `${bias.equity_30d_pct >= 0 ? "+" : ""}${bias.equity_30d_pct.toFixed(2)}%`
+              : "—", pnlColor(bias.equity_30d_pct)],
+            ["Data age", bias.last_update_age_h != null ? `${bias.last_update_age_h}h ago` : "—",
+             bias.is_fresh ? theme.green : theme.red],
+          ].map(([label, value, color]) => (
+            <div key={label} style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 9, color: theme.textFaint, fontFamily: theme.mono, letterSpacing: 0.5 }}>{label}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: color || theme.text, fontFamily: theme.mono }}>{value}</div>
+            </div>
+          ))}
+
+          {!bias.is_fresh && (
+            <div style={{ fontSize: 9, color: theme.red, fontFamily: theme.mono, marginTop: 4 }}>
+              ⚠ STALE — repo updates daily
+            </div>
+          )}
+          {bias.error && (
+            <div style={{ fontSize: 9, color: theme.red, fontFamily: theme.mono, marginTop: 4,
+              wordBreak: "break-all" }}>
+              ERR: {bias.error.slice(0, 60)}
+            </div>
+          )}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 function DataSourcesPanel({ ds }) {
   if (!ds) return (
     <Panel title="Data Sources" subtitle="Loading…" accent={theme.amber}>
@@ -727,11 +864,12 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [datasources, setDatasources] = useState(null);
   const [newListings, setNewListings] = useState({});
+  const [btcBias, setBtcBias] = useState(null);
   const [connected, setConnected] = useState(false);
 
   const fetchData = useCallback(async () => {
     try {
-      const [s, d, se, si, p, ct, st, ds, nl] = await Promise.all([
+      const [s, d, se, si, p, ct, st, ds, nl, bb] = await Promise.all([
         fetch(`${API_BASE}/api/status`).then((r) => r.json()),
         fetch(`${API_BASE}/api/divergences`).then((r) => r.json()),
         fetch(`${API_BASE}/api/sentiments`).then((r) => r.json()),
@@ -741,6 +879,7 @@ export default function App() {
         fetch(`${API_BASE}/api/stats`).then((r) => r.json()),
         fetch(`${API_BASE}/api/datasources`).then((r) => r.json()).catch(() => null),
         fetch(`${API_BASE}/api/new-listings`).then((r) => r.json()).catch(() => ({})),
+        fetch(`${API_BASE}/api/btc-bias`).then((r) => r.json()).catch(() => null),
       ]);
       setStatus(s);
       setDivergences(d);
@@ -751,6 +890,7 @@ export default function App() {
       setStats(st);
       if (ds) setDatasources(ds);
       if (nl) setNewListings(nl);
+      if (bb) setBtcBias(bb);
       setConnected(true);
     } catch (e) {
       setConnected(false);
@@ -910,7 +1050,7 @@ export default function App() {
         flex: 1,
         display: "grid",
         gridTemplateColumns: "1fr 1fr",
-        gridTemplateRows: "1fr 1fr auto auto auto",
+        gridTemplateRows: "1fr 1fr auto auto auto auto",
         gap: 1,
         background: theme.border,
         padding: 1,
@@ -930,16 +1070,20 @@ export default function App() {
         <div style={{ gridColumn: "2 / 3", gridRow: "2 / 3", minHeight: 0 }}>
           <SentimentPanel sentiments={sentiments} />
         </div>
-        {/* Row 3 — New Listings (full width) */}
+        {/* Row 3 — BTC Smart Money Bias (full width) */}
         <div style={{ gridColumn: "1 / 3", gridRow: "3 / 4", minHeight: 0 }}>
+          <BTCBiasPanel bias={btcBias} />
+        </div>
+        {/* Row 4 — New Listings (full width) */}
+        <div style={{ gridColumn: "1 / 3", gridRow: "4 / 5", minHeight: 0 }}>
           <NewListingsPanel setups={newListings} />
         </div>
-        {/* Row 4 — Data Sources (full width) */}
-        <div style={{ gridColumn: "1 / 3", gridRow: "4 / 5", minHeight: 0 }}>
+        {/* Row 5 — Data Sources (full width) */}
+        <div style={{ gridColumn: "1 / 3", gridRow: "5 / 6", minHeight: 0 }}>
           <DataSourcesPanel ds={datasources} />
         </div>
-        {/* Row 5 — Closed Trades (full width) */}
-        <div style={{ gridColumn: "1 / 3", gridRow: "5 / 6", minHeight: 0 }}>
+        {/* Row 6 — Closed Trades (full width) */}
+        <div style={{ gridColumn: "1 / 3", gridRow: "6 / 7", minHeight: 0 }}>
           <ClosedTradesPanel trades={closedTrades} />
         </div>
       </main>

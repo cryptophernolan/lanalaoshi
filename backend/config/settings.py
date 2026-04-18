@@ -172,6 +172,18 @@ class NewListingConfig:
 
 
 @dataclass
+class BTCBiasConfig:
+    """Config cho BTCBiasAnalyzer (Smart Money signal từ Paul Wei's account)."""
+    enabled: bool = True
+    refresh_interval_seconds: int = 3600   # fetch mỗi 1 tiếng (repo update daily)
+    # Ngưỡng confidence để tác động lên signal score
+    min_confidence_to_boost: float = 0.35  # confidence >= 35% → cộng điểm
+    min_confidence_to_suppress: float = 0.45  # confidence >= 45% → trừ điểm
+    # Max score delta (+-) BTCBias có thể ảnh hưởng lên signal
+    max_score_delta: int = 3
+
+
+@dataclass
 class BacktestConfig:
     data_path: str = "./data/historical"
     initial_capital: float = 10_000.0
@@ -192,6 +204,7 @@ class AppConfig:
     executor: ExecutorConfig = field(default_factory=ExecutorConfig)
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     new_listing: NewListingConfig = field(default_factory=NewListingConfig)
+    btc_bias: BTCBiasConfig = field(default_factory=BTCBiasConfig)
     
     # Telegram alerts
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
