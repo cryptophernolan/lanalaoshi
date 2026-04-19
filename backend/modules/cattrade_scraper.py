@@ -37,7 +37,7 @@ _DIRECTION_BIAS = {
     "下拐":   -1,  # turning bearish
 }
 
-# Mapping 结构形态 → bias
+# Mapping 结构形态 → bias  (dùng substring match để chịu garbling)
 _STRUCTURE_BIAS = {
     "大户领先做多": 1,
     "多头共振":     1,
@@ -46,6 +46,33 @@ _STRUCTURE_BIAS = {
     "空头共振":     -1,
     "主动买领先空": -1,
 }
+
+
+def _structure_bias_fuzzy(pattern: str) -> int:
+    """
+    Fuzzy match structure bias — chịu được encoding garbling.
+    `做` (\u505a) có thể bị garble thành \udc81 hoặc ký tự khác.
+    """
+    if not pattern:
+        return 0
+    # Exact match first
+    exact = _STRUCTURE_BIAS.get(pattern, None)
+    if exact is not None:
+        return exact
+    # Substring-based fallback
+    if "大户领先" in pattern and "多" in pattern:
+        return 1
+    if "多头共振" in pattern:
+        return 1
+    if "主动买领先多" in pattern:
+        return 1
+    if "大户领先" in pattern and "空" in pattern:
+        return -1
+    if "空头共振" in pattern:
+        return -1
+    if "主动买领先空" in pattern:
+        return -1
+    return 0
 
 
 @dataclass
@@ -86,7 +113,7 @@ class CattradeSignal:
         score = 0
         score += _DIRECTION_BIAS.get(self.oi_vol_direction or "", 0)
         score += _DIRECTION_BIAS.get(self.oi_val_direction or "", 0)
-        score += _STRUCTURE_BIAS.get(self.structure_pattern or "", 0)
+        score += _structure_bias_fuzzy(self.structure_pattern or "")
         if score > 0:
             return 1
         if score < 0:
@@ -173,42 +200,76 @@ class CattradeScraper:
             rows = list(reader)
 
             current_section = ""
+            # Track multi-window sections order: first = 量, second = 额
+            _multi_window_seen = 0
+
             for row in rows:
                 if not row or len(row) < 3:
                     continue
 
                 col0 = row[0].strip()
 
-                # Detect section header lines (col0 non-empty, col1 = "序号")
-                if col0 and len(row) > 1 and row[1].strip() in ("序号", ""):
-                    if "异动" in col0 or "持仓" in col0 or "份额" in col0 or "波动" in col0 or "结构" in col0:
+                # ── Section header detection ──
+                # Header rows: col0 non-empty, col1 is NOT a digit (rank number)
+                # Note: col1 = "序号" but may be garbled → just check col0 non-empty
+                if col0:
+                    detected = False
+                    if "异动" in col0:
                         current_section = col0
+                        detected = True
+                    elif "多窗" in col0:
+                        # 多窗口持仓量榜 vs 多窗口持仓额榜
+                        # Distinguish by garbled char: 量→\udc8f, 额→\udc9d
+                        # OR by order (量 always comes first in sheet)
+                        _multi_window_seen += 1
+                        if _multi_window_seen == 1:
+                            current_section = "多窗口持仓量榜"  # normalized
+                        else:
+                            current_section = "多窗口持仓额榜"  # normalized
+                        detected = True
+                    elif "市场份" in col0:
+                        current_section = "市场份额相对榜"
+                        detected = True
+                    elif "波动区间" in col0:
+                        current_section = "波动区间榜"
+                        detected = True
+                    elif "结构分" in col0:
+                        current_section = "结构分歧榜"
+                        detected = True
+                    if detected:
+                        continue
+                    # Non-section non-empty col0 = ad/metadata → skip
                     continue
 
-                # Data rows: col0 empty, col1 is rank number
-                if col0 != "" or len(row) < 3:
-                    continue
-
+                # ── Data rows: col0 empty, col1 = rank digit ──
                 rank_str = row[1].strip()
                 if not rank_str.isdigit():
                     continue
 
-                symbol = row[2].strip()
-                if not symbol.endswith("USDT"):
+                # Symbol is base symbol WITHOUT USDT (sheet format)
+                base = row[2].strip()
+                if not base or len(base) > 15:
                     continue
+                # Filter out non-symbol garbage (Chinese chars, spaces, etc.)
+                if any(ord(c) > 0x2E7F for c in base):
+                    continue  # skip garbled/Chinese symbol names
 
-                base = symbol.replace("USDT", "")
+                # Binance futures symbol = base + USDT
+                symbol = base + "USDT"
 
                 if base not in signals:
                     signals[base] = CattradeSignal(symbol=symbol, base=base)
 
                 sig = signals[base]
 
-                # ── 异动榜 (5m/15m/1h/4h/1d/1w) ──
+                # ── 异动榜 (5m/15m/30m/1h/2h/4h/1d/1w) ──
                 if "异动" in current_section:
-                    tf = current_section.split()[0]  # "5m", "15m", "1h", "4h", "1d", "1w"
-                    if tf not in sig.timeframe_rankings:
+                    # Extract timeframe from section name prefix (e.g. "1h 异动榜" → "1h")
+                    parts = current_section.split()
+                    tf = parts[0] if parts else ""
+                    if tf and tf not in sig.timeframe_rankings:
                         sig.timeframe_rankings.append(tf)
+                    # Z-scores: col9=量Z分数, col10=额Z分数
                     if len(row) > 10:
                         if tf == "1h":
                             sig.zscore_vol_1h = _f(row[9])
@@ -218,33 +279,44 @@ class CattradeScraper:
                             sig.zscore_val_4h = _f(row[10])
 
                 # ── 多窗口持仓量榜 ──
-                elif "多窗口持仓量" in current_section:
-                    if len(row) > 14:
-                        sig.oi_vol_direction = row[12].strip() or None
+                # cols: rank, symbol, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w, 冲击比, 方向, 异常分, 现持仓额
+                elif current_section == "多窗口持仓量榜":
+                    if len(row) > 13:
+                        raw_dir = row[12].strip()
+                        sig.oi_vol_direction = raw_dir or None
                         sig.oi_vol_anomaly_score = _f(row[13])
 
                 # ── 多窗口持仓额榜 ──
-                elif "多窗口持仓额" in current_section:
-                    if len(row) > 14:
-                        sig.oi_val_direction = row[12].strip() or None
+                elif current_section == "多窗口持仓额榜":
+                    if len(row) > 13:
+                        raw_dir = row[12].strip()
+                        sig.oi_val_direction = raw_dir or None
                         sig.oi_val_anomaly_score = _f(row[13])
 
                 # ── 市场份额相对榜 ──
-                elif "市场份额" in current_section:
+                # cols: rank, symbol, 市场份额, 5m份额变化, 1h份额变化, 5m量超额变动,
+                #        5m额超额变动, 1h量超额变动, 1h额超额变动, 异常综合分, 现持仓额
+                elif current_section == "市场份额相对榜":
                     if len(row) > 10:
-                        sig.market_share_score = _f(row[9])
+                        sig.market_share_score = _f(row[10])  # col10 = 异常综合分
 
                 # ── 波动区间榜 ──
-                elif "波动区间" in current_section:
-                    if len(row) > 7:
+                # cols: rank, symbol, 量连续根数, 额连续根数, 1h量波动Z分数, 1h额波动Z分数, ...
+                elif current_section == "波动区间榜":
+                    if len(row) > 6:
                         sig.zscore_vol_1h = max(sig.zscore_vol_1h, abs(_f(row[5])))
                         sig.zscore_val_1h = max(sig.zscore_val_1h, abs(_f(row[6])))
 
                 # ── 结构分歧榜 ──
-                elif "结构分歧" in current_section:
+                # cols: rank, symbol, 主动买比(taker), 大户账户比5m变化, 大户仓比5m变化,
+                #        全市场账户比5m变化, 主动买比5m变化, 5m结构变化强度, 1h结构变化强度,
+                #        大户仓-市场账户, 主动买-市场账户, 大户集中度, 结构共识分, 结构冲突分,
+                #        主动买滞后数, 结构形态(col16), 结构强度(col17), 现持仓额(col18)
+                elif current_section == "结构分歧榜":
                     if len(row) > 17:
                         sig.taker_ratio = _f(row[3])
-                        sig.structure_pattern = row[16].strip() or None
+                        pattern = row[16].strip()
+                        sig.structure_pattern = pattern or None
                         sig.structure_strength = _f(row[17])
 
             self._cache = signals

@@ -101,8 +101,8 @@ class SignalAggregator:
                 score -= 1  # direction conflict → weaken signal
 
             # Structure pattern (大户 whale leading) matches signal
-            from modules.cattrade_scraper import _STRUCTURE_BIAS
-            struct_bias = _STRUCTURE_BIAS.get(cattrade.structure_pattern or "", 0)
+            from modules.cattrade_scraper import _structure_bias_fuzzy
+            struct_bias = _structure_bias_fuzzy(cattrade.structure_pattern or "")
             if struct_bias != 0 and struct_bias == signal_bias:
                 score += 2  # whale accumulation matches direction
             elif struct_bias != 0 and struct_bias != signal_bias:
