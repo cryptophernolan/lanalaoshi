@@ -1,0 +1,13 @@
+dashboard/node_modules
+dashboard/dist
+dashboard/.vite
+**/__pycache__
+**/*.pyc
+**/*.pyo
+data/
+logs/
+.git
+.venv
+venv
+*.env
+!backend/config/.env
