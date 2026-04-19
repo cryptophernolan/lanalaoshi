@@ -106,11 +106,10 @@ class OIScanner:
             if abs(price_change_pct) > self.cfg.max_price_change_pct:
                 return None
             
-            # Divergence ratio
-            if abs(price_change_pct) < 0.1:
-                ratio = abs(oi_change_pct) / 0.1  # avoid div by zero
-            else:
-                ratio = abs(oi_change_pct) / abs(price_change_pct)
+            # Divergence ratio — dùng min denominator 0.3% để tránh inflate ratio
+            # khi price chạy < 0.3% (ví dụ: OI +3% / price +0.05% = ratio 60 — fake strong)
+            MIN_PRICE_DENOM = 0.3
+            ratio = abs(oi_change_pct) / max(abs(price_change_pct), MIN_PRICE_DENOM)
             
             if ratio < self.cfg.min_divergence_ratio:
                 return None

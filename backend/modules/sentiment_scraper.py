@@ -157,19 +157,27 @@ class SentimentScraper:
                 await browser.close()
 
             for post in all_posts:
+                # Dedup per-post: mỗi ticker chỉ được đếm 1 lần/post
+                # dù xuất hiện cả trong tradingPairs lẫn title/content
+                post_tickers: set[str] = set()
+
                 # tradingPairs là tags chính xác do user/AI gán
                 pairs = post.get("tradingPairs") or post.get("tradingPairsV2") or []
                 for pair in pairs:
                     code = (pair.get("code") or "").upper()
                     if code and code not in self.cfg.excluded_tickers:
-                        results[code]["mentions"] += 1
+                        post_tickers.add(code)
 
                 # Scan title + content text để bắt mentions không có tag
                 text = f"{post.get('title') or ''} {post.get('content') or ''}"
                 if text.strip():
                     for ticker in TICKER_RE.findall(text):
                         if ticker not in self.cfg.excluded_tickers and ticker not in _COMMON_WORDS:
-                            results[ticker]["mentions"] += 1
+                            post_tickers.add(ticker)
+
+                # Count 1 lần per post per ticker
+                for ticker in post_tickers:
+                    results[ticker]["mentions"] += 1
 
             self._last_bs_posts = len(all_posts)
             self._last_bs_tickers = len(results)
@@ -318,9 +326,13 @@ class SentimentScraper:
             for post in posts:
                 data = post.get("data", {})
                 text = f"{data.get('title', '')} {data.get('selftext', '')}"
+                # Dedup per-post — Reddit title hay thể lặp ticker nhiều lần
+                post_tickers: set[str] = set()
                 for ticker in TICKER_RE.findall(text):
                     if ticker not in self.cfg.excluded_tickers and ticker not in _COMMON_WORDS:
-                        results[ticker]["mentions"] += 1
+                        post_tickers.add(ticker)
+                for ticker in post_tickers:
+                    results[ticker]["mentions"] += 1
             logger.info(f"Reddit: {len(results)} tickers found")
         except Exception as e:
             logger.warning(f"Reddit fetch failed: {e}")

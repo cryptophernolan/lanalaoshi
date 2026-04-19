@@ -144,6 +144,16 @@ class Bot:
         # Sync latest setups cache
         self.latest_new_listing_setups = dict(self.new_listing_scanner._setups)
         for signal in signals:
+            # Chia sẻ cooldown với aggregator — tránh duplicate với OI signal cùng symbol+direction
+            if self.aggregator._is_in_cooldown(signal.symbol, signal.side):
+                logger.debug(
+                    f"NewListing {signal.symbol} {signal.side.value} in aggregator cooldown, skip"
+                )
+                continue
+            # Đăng ký vào shared cooldown để OI path không fire lại ngay sau
+            self.aggregator._recent_signals[
+                (signal.symbol, signal.side.value)
+            ] = datetime.utcnow()
             await self._process_signal(signal)
             await self._broadcast({
                 "type": "new_listing_signal",

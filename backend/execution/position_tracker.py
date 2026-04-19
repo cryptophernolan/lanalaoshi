@@ -100,6 +100,17 @@ class PositionTracker:
             else:
                 reason = "MANUAL"
         
+        # Phí taker round-trip: 0.04% mỗi chiều = 0.08% tổng
+        # notional = size_usdt * leverage (size_usdt là margin collateral)
+        notional = pos.size_usdt * pos.leverage
+        fees_usdt = notional * 0.0008
+
+        # PnL thực tế = unrealized PnL - phí giao dịch
+        net_pnl_usdt = pos.unrealized_pnl_usdt - fees_usdt
+        # PnL% thực tế (tính trên collateral)
+        fee_pct_on_collateral = (fees_usdt / pos.size_usdt * 100) if pos.size_usdt > 0 else 0
+        net_pnl_pct = pos.unrealized_pnl_pct - fee_pct_on_collateral
+
         closed = ClosedTrade(
             symbol=pos.symbol,
             side=pos.side,
@@ -107,9 +118,9 @@ class PositionTracker:
             exit_price=pos.current_price,
             size_usdt=pos.size_usdt,
             leverage=pos.leverage,
-            realized_pnl_usdt=pos.unrealized_pnl_usdt,
-            realized_pnl_pct=pos.unrealized_pnl_pct,
-            fees_usdt=pos.size_usdt * pos.leverage * 0.0008,  # ~0.08% round trip
+            realized_pnl_usdt=net_pnl_usdt,
+            realized_pnl_pct=net_pnl_pct,
+            fees_usdt=fees_usdt,
             opened_at=pos.opened_at,
             closed_at=datetime.utcnow(),
             exit_reason=reason,

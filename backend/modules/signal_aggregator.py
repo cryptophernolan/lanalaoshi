@@ -32,16 +32,30 @@ class SignalAggregator:
         self.oi_cfg = config.oi_scanner
         self.risk_cfg = config.risk
         self.bias_cfg = config.btc_bias
-        self._recent_signals: dict[str, datetime] = {}  # symbol → last signal time
-        self._cooldown_minutes = 30
+        self._recent_signals: dict[tuple[str, str], datetime] = {}  # (symbol, direction) → last signal time
+        self._cooldown_minutes = 60  # per-direction cooldown (60 min)
         # BTCBiasAnalyzer instance (injected từ main.py)
         self._btc_bias = btc_bias_analyzer
     
     def _base_symbol(self, pair_symbol: str) -> str:
         return pair_symbol.replace("USDT", "")
     
-    def _is_in_cooldown(self, symbol: str) -> bool:
-        last = self._recent_signals.get(symbol)
+    def _is_in_cooldown(self, symbol: str, direction: "Side | None" = None) -> bool:
+        """
+        Cooldown per (symbol, direction) — cho phép reverse direction signal sau 10 phút,
+        nhưng cùng direction phải đợi đủ 60 phút.
+        """
+        if direction is None:
+            # Legacy check — không biết direction → dùng worst-case (longest remaining)
+            for key, last in self._recent_signals.items():
+                if key[0] == symbol:
+                    delta = (datetime.utcnow() - last).total_seconds() / 60
+                    if delta < self._cooldown_minutes:
+                        return True
+            return False
+
+        key = (symbol, direction.value)
+        last = self._recent_signals.get(key)
         if not last:
             return False
         delta = (datetime.utcnow() - last).total_seconds() / 60
@@ -118,21 +132,33 @@ class SignalAggregator:
                 score += 1
 
         # ── BTCBias (Smart Money) ──
-        # Chỉ áp dụng cho BTC signals (BTCUSDT / XBTUSD) hoặc dùng như market regime filter
+        # BTC: full delta. Alts: half delta (BTC correlation ~70% → signal masih relevant).
         if self._btc_bias and self.bias_cfg.enabled:
             bias = self._btc_bias.get_bias()
             if bias.is_fresh and bias.direction != "NEUTRAL":
                 signal_dir_str = "LONG" if divergence.direction == Side.LONG else "SHORT"
                 delta = self._btc_bias.get_score_delta(signal_dir_str)
 
-                # Chỉ áp dụng delta nếu đủ confidence ngưỡng
+                # Fix 6: alts nhận half delta (int truncate → nhỏ hơn 0 cũng bị giảm)
+                is_btc_symbol = divergence.symbol in ("BTCUSDT", "XBTUSD")
+                if not is_btc_symbol:
+                    delta = int(delta / 2)  # 2→1, 1→0, -2→-1, -1→0
+
+                # Fix 8: freshness decay — data > 30 phút thì giảm confidence
+                # (Paul Wei có thể đã flip position trong vòng 1h refresh interval)
+                age_decay = (
+                    max(0.0, 1.0 - (bias.age_hours - 0.5) / 25.5)
+                    if bias.age_hours > 0.5 else 1.0
+                )
+                effective_confidence = bias.confidence * age_decay
+
                 same = (
                     (signal_dir_str == "LONG"  and bias.direction == "BULLISH") or
                     (signal_dir_str == "SHORT" and bias.direction == "BEARISH")
                 )
-                if same and bias.confidence >= self.bias_cfg.min_confidence_to_boost:
+                if same and effective_confidence >= self.bias_cfg.min_confidence_to_boost:
                     score += min(delta, self.bias_cfg.max_score_delta)
-                elif not same and bias.confidence >= self.bias_cfg.min_confidence_to_suppress:
+                elif not same and effective_confidence >= self.bias_cfg.min_confidence_to_suppress:
                     score += max(delta, -self.bias_cfg.max_score_delta)
 
         if score >= 7:
@@ -141,6 +167,42 @@ class SignalAggregator:
             return SignalStrength.MEDIUM, score
         return SignalStrength.WEAK, score
     
+    def _cattrade_hard_veto(
+        self,
+        divergence: OIDivergence,
+        cattrade: Optional[CattradeSignal],
+    ) -> bool:
+        """
+        Hard veto khi CatTrade đồng thời conflict trên CẢ 3 dimension:
+          - direction_bias (multi-window average)
+          - structure_pattern (whale activity)
+          - multi-timeframe confirmation (≥2 TFs)
+
+        Một điểm conflict (-1đ) không đủ để veto — phải cả 3 cùng nói ngược.
+        """
+        if not cattrade:
+            return False
+
+        signal_bias = 1 if divergence.direction == Side.LONG else -1
+        ct_bias = cattrade.direction_bias
+
+        from modules.cattrade_scraper import _structure_bias_fuzzy
+        struct_bias = _structure_bias_fuzzy(cattrade.structure_pattern or "")
+
+        direction_conflict  = ct_bias != 0 and ct_bias != signal_bias
+        structure_conflict  = struct_bias != 0 and struct_bias != signal_bias
+        multi_tf_confirmed  = len(cattrade.timeframe_rankings) >= 2
+
+        if direction_conflict and structure_conflict and multi_tf_confirmed:
+            logger.info(
+                f"CatTrade HARD VETO {divergence.symbol}: "
+                f"signal={'+' if signal_bias > 0 else '-'} "
+                f"ct_dir={ct_bias} struct={struct_bias} "
+                f"TF={cattrade.timeframe_rankings}"
+            )
+            return True
+        return False
+
     def _compute_position_size(
         self, strength: SignalStrength, account_balance: float
     ) -> tuple[float, int]:
@@ -193,13 +255,17 @@ class SignalAggregator:
         cattrades = cattrades or {}
 
         for div in divergences:
-            if self._is_in_cooldown(div.symbol):
-                logger.debug(f"{div.symbol} in cooldown, skip")
+            if self._is_in_cooldown(div.symbol, div.direction):
+                logger.debug(f"{div.symbol} {div.direction.value} in cooldown, skip")
                 continue
 
             base = self._base_symbol(div.symbol)
             sentiment = sentiments.get(base)
             cattrade = cattrades.get(base)
+
+            # Fix 5: CatTrade hard veto — tất cả 3 dimension đều ngược → skip
+            if self._cattrade_hard_veto(div, cattrade):
+                continue
 
             strength, score = self._determine_strength(div, sentiment, cattrade)
 
@@ -255,7 +321,7 @@ class SignalAggregator:
                 signal_id=str(uuid.uuid4())[:8],
             )
             signals.append(signal)
-            self._recent_signals[div.symbol] = datetime.utcnow()
+            self._recent_signals[(div.symbol, div.direction.value)] = datetime.utcnow()
         
         # Sort by strength + confidence
         strength_order = {
