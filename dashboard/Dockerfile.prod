@@ -1,0 +1,14 @@
+# Stage 1: Build React app
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+# Empty API_BASE → dùng relative path, nginx proxy sẽ handle /api và /ws
+RUN VITE_API_BASE="" VITE_WS_URL="" npm run build
+
+# Stage 2: Serve với nginx
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+# nginx config được mount từ docker-compose
+EXPOSE 80

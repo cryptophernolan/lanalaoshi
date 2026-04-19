@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useCallback } from "react";
 
-const API_BASE = "http://localhost:8000";
-const WS_URL = "ws://localhost:8000/ws";
+// Production: VITE_API_BASE="" (dùng relative path qua nginx proxy)
+// Local dev:  VITE_API_BASE="http://localhost:8000" (default)
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+const WS_URL   = import.meta.env.VITE_WS_URL   ?? "ws://localhost:8000/ws";
 
 // ============ DESIGN TOKENS ============
 // Aesthetic: Bloomberg Terminal meets brutalist quant dashboard
