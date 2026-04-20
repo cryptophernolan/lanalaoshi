@@ -58,7 +58,9 @@ class OIScannerConfig:
 class SentimentConfig:
     # Binance Square (Playwright headless — không cần key)
     binance_square_enabled: bool = True
-    binance_square_pages_per_scene: int = 5   # 3 scenes × 5 pages × 20 posts = 300 posts max
+    binance_square_pages_per_scene: int = 8   # 6 tabs × 8 scrolls × 20 posts ≈ 960 posts (Playwright)
+                                               # + Direct API pagination (HOT+NEW): +300-600 posts
+                                               # Total target: ~1000-1500 unique posts/scan
 
     # CryptoPanic (https://cryptopanic.com — đăng ký free để lấy key)
     cryptopanic_enabled: bool = True

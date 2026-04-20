@@ -2,15 +2,22 @@
 Sentiment Scraper — tầng confirm cho OI signal.
 
 Nguồn (theo thứ tự ưu tiên):
-1. Binance Square   — feed posts với tradingPairs tags (Playwright headless)
+1. Binance Square   — feed posts với tradingPairs tags (Playwright headless + direct API)
 2. CryptoPanic API  — news mentions + vote sentiment per ticker (free key required)
 3. Reddit           — r/CryptoCurrency hot posts, count ticker mentions (no key)
 4. Alternative.me   — Fear & Greed Index global (no key)
 5. CoinGecko        — Trending coins (no key)
 6. Binance Gainers  — 24h top movers (no key)
 
-Binance Square dùng Playwright headless để bypass Cloudflare bot detection.
-Nếu không có CRYPTOPANIC_API_KEY → tự động dùng Reddit thay thế.
+Binance Square dùng 2 phương pháp song song:
+  - Playwright headless: scroll 6 tabs (for-you / hot / new / trending / topics / search)
+    để bypass Cloudflare — intercept feed-recommend/list responses
+  - Direct API pagination: POST tới feed-recommend/list trực tiếp với cursor
+    để lấy thêm posts không giới hạn 20/trang
+
+Bot filter (theo phương pháp lana @lanaaielsa):
+  "Users who've changed their username = human; unchanged usernames with tons
+   of posts are probably bots." → chỉ đếm human mentions vào scoring.
 """
 import re
 import math
@@ -27,6 +34,23 @@ from config.settings import config
 logger = logging.getLogger(__name__)
 
 TICKER_RE = re.compile(r"\b([A-Z]{2,10})\b")
+
+# ─── Bot Username Detection (Lana's method) ───────────────────────────────────
+# Binance Square default (unchanged) username patterns:
+#   • "User" + 4+ digits  → e.g. "User123456"  (Binance auto-assign)
+#   • 1-4 letters + 6+ digits → e.g. "BN12345678", "bs98765432"
+#   • Pure digit string 6+ → e.g. "123456789"
+#   • Hex-like 10+ chars  → e.g. "a3f9b2c7d8e1"
+_BOT_USERNAME_RE = re.compile(
+    r'^('
+    r'[Uu]ser\d{4,}'           # "User123456"
+    r'|[A-Za-z]{1,4}\d{6,}'   # "BN12345678", "sq98765432"
+    r'|\d{6,}'                 # "123456789"
+    r'|[a-f0-9]{10,}'          # "a3f9b2c7d8e1" hex IDs
+    r')$'
+)
+# Max posts per author in one scrape session before flagging as spam bot
+_BOT_POST_THRESHOLD = 6
 
 # Common English words that match TICKER_RE but are not tickers
 _COMMON_WORDS = {
@@ -56,6 +80,8 @@ class SentimentScraper:
         # ── Data source status tracking ──
         self._last_scan_ts: Optional[float] = None
         self._last_bs_posts: int = 0
+        self._last_bs_human_posts: int = 0
+        self._last_bs_bot_filtered: int = 0
         self._last_bs_tickers: int = 0
         self._last_cp_tickers: int = 0
         self._last_reddit_tickers: int = 0
@@ -66,130 +92,307 @@ class SentimentScraper:
         self._using_reddit_fallback: bool = False
 
     # ──────────────────────────────────────────────
-    # SOURCE 0: Binance Square (Playwright headless)
+    # Bot detection helper (Lana's method)
     # ──────────────────────────────────────────────
 
-    async def fetch_binance_square(self) -> dict[str, dict]:
+    @staticmethod
+    def _is_likely_bot(nickname: str, author_post_count: int = 0) -> bool:
         """
-        Scrape Binance Square dùng Playwright scroll-intercept.
+        Lana's heuristic: users who haven't changed their default Binance
+        username = likely bots or auto-accounts.
+        Unchanged default format → bot. Also flag spam (>_BOT_POST_THRESHOLD posts/session).
 
-        Cơ chế: load trang → scroll xuống nhiều lần để trigger infinite scroll
-        → intercept TẤT CẢ responses từ feed-recommend/list (browser tự gắn
-        đủ cookies/WAF token — không bị chặn).
-
-        Quét 3 URL tabs:
-          /en/square        — "For You" homepage feed
-          /en/square/hot    — Hot trending posts
-          /en/square/new    — Newest posts
-
-        Mỗi tab scroll binance_square_pages_per_scene lần × ~20 posts/scroll.
-        Tối đa: 3 tabs × N scrolls × ~20 posts = ~300 posts.
-
-        Returns: { "BTC": {"mentions": 5, "bullish": 0, "bearish": 0} }
+        Returns True if the author should be treated as a bot.
         """
-        if not self.cfg.binance_square_enabled:
-            return {}
+        if not nickname:
+            return True
+        nick = nickname.strip()
+        # Matches known default/auto-generated username patterns
+        if _BOT_USERNAME_RE.match(nick):
+            return True
+        # High digit ratio + longer string → likely auto-generated
+        if len(nick) >= 9 and sum(c.isdigit() for c in nick) / len(nick) > 0.5:
+            return True
+        # Too many posts in one scrape session = spam bot
+        if author_post_count > _BOT_POST_THRESHOLD:
+            return True
+        return False
 
-        results: dict[str, dict] = defaultdict(lambda: {"mentions": 0, "bullish": 0, "bearish": 0})
-        pages_per_tab = self.cfg.binance_square_pages_per_scene
+    # ──────────────────────────────────────────────
+    # SOURCE 0a: Binance Square (Playwright headless)
+    # ──────────────────────────────────────────────
+
+    async def _bs_playwright_scrape(
+        self, pages_per_tab: int
+    ) -> list[dict]:
+        """
+        Playwright scroll-intercept across 6 Binance Square tabs.
+
+        Tabs:
+          /en/square              — "For You" personalised feed
+          /en/square/hot          — Hot trending posts
+          /en/square/new          — Newest posts
+          /en/square/following    — Following feed (extra variety)
+          /zh-CN/square           — Chinese-language feed (huge user base)
+          /en/square?type=trending — Trending via query param (duplicate avoidance)
+
+        Each tab scrolls `pages_per_tab` times × ~20 posts/scroll.
+        Max: 6 tabs × 8 scrolls × 20 posts ≈ 960 posts.
+
+        Returns raw list[dict] of deduplicated post VOs.
+        """
+        from playwright.async_api import async_playwright
 
         tabs = [
             "https://www.binance.com/en/square",
             "https://www.binance.com/en/square/hot",
             "https://www.binance.com/en/square/new",
+            "https://www.binance.com/en/square/following",
+            "https://www.binance.com/zh-CN/square/hot",   # CN feed for alt-coin coverage
+            "https://www.binance.com/en/square/new?type=trending",
         ]
 
-        try:
-            from playwright.async_api import async_playwright
+        all_posts: list[dict] = []
+        seen_ids: set[str] = set()
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-                )
-                context = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    locale="en-US",
-                )
-
-                all_posts: list[dict] = []
-                seen_ids: set[str] = set()
-
-                for tab_url in tabs:
-                    page = await context.new_page()
-                    tab_posts: list[dict] = []
-
-                    async def on_feed_response(resp, _tab_posts=tab_posts):
-                        if "feed-recommend/list" in resp.url and resp.status == 200:
-                            try:
-                                body = await resp.json()
-                                vos = (body.get("data") or {}).get("vos") or []
-                                _tab_posts.extend(vos)
-                            except Exception:
-                                pass
-
-                    page.on("response", on_feed_response)
-
-                    try:
-                        await page.goto(tab_url, wait_until="domcontentloaded", timeout=30_000)
-                        # Đợi batch đầu tiên load
-                        await asyncio.sleep(2)
-
-                        # Scroll để trigger infinite scroll nhiều lần
-                        for _ in range(pages_per_tab - 1):
-                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            await asyncio.sleep(1.5)
-
-                    except Exception as e:
-                        logger.debug(f"Binance Square tab {tab_url}: {e}")
-
-                    await page.close()
-
-                    # Deduplicate và thêm vào all_posts
-                    for post in tab_posts:
-                        pid = post.get("id", "")
-                        if pid and pid in seen_ids:
-                            continue
-                        if pid:
-                            seen_ids.add(pid)
-                        all_posts.append(post)
-
-                await browser.close()
-
-            for post in all_posts:
-                # Dedup per-post: mỗi ticker chỉ được đếm 1 lần/post
-                # dù xuất hiện cả trong tradingPairs lẫn title/content
-                post_tickers: set[str] = set()
-
-                # tradingPairs là tags chính xác do user/AI gán
-                pairs = post.get("tradingPairs") or post.get("tradingPairsV2") or []
-                for pair in pairs:
-                    code = (pair.get("code") or "").upper()
-                    if code and code not in self.cfg.excluded_tickers:
-                        post_tickers.add(code)
-
-                # Scan title + content text để bắt mentions không có tag
-                text = f"{post.get('title') or ''} {post.get('content') or ''}"
-                if text.strip():
-                    for ticker in TICKER_RE.findall(text):
-                        if ticker not in self.cfg.excluded_tickers and ticker not in _COMMON_WORDS:
-                            post_tickers.add(ticker)
-
-                # Count 1 lần per post per ticker
-                for ticker in post_tickers:
-                    results[ticker]["mentions"] += 1
-
-            self._last_bs_posts = len(all_posts)
-            self._last_bs_tickers = len(results)
-            logger.info(
-                f"Binance Square: {len(results)} tickers from {len(all_posts)} posts "
-                f"({len(tabs)} tabs × {pages_per_tab} scrolls)"
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
             )
 
+            for tab_url in tabs:
+                page = await context.new_page()
+                tab_posts: list[dict] = []
+
+                async def on_feed_response(resp, _tab_posts=tab_posts):
+                    if "feed-recommend/list" in resp.url and resp.status == 200:
+                        try:
+                            body = await resp.json()
+                            vos = (body.get("data") or {}).get("vos") or []
+                            _tab_posts.extend(vos)
+                        except Exception:
+                            pass
+
+                page.on("response", on_feed_response)
+
+                try:
+                    await page.goto(tab_url, wait_until="domcontentloaded", timeout=30_000)
+                    await asyncio.sleep(2)  # đợi batch đầu tiên
+
+                    for _ in range(pages_per_tab - 1):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1.2)
+
+                except Exception as e:
+                    logger.debug(f"BS Playwright tab {tab_url}: {e}")
+
+                await page.close()
+
+                # Deduplicate và append
+                for post in tab_posts:
+                    pid = post.get("id", "")
+                    if pid and pid in seen_ids:
+                        continue
+                    if pid:
+                        seen_ids.add(pid)
+                    all_posts.append(post)
+
+            await browser.close()
+
+        return all_posts
+
+    # ──────────────────────────────────────────────
+    # SOURCE 0b: Binance Square Direct API pagination
+    # ──────────────────────────────────────────────
+
+    async def _bs_api_paginate(
+        self, feed_type: str = "HOT", max_pages: int = 15
+    ) -> list[dict]:
+        """
+        Direct POST pagination to Binance Square feed-recommend/list API.
+        Không cần Playwright — gọi thẳng endpoint với cursor pagination.
+        Bypasses the "only 20 posts" limit bằng cách follow cursor.
+
+        Thường trả về thêm 100-300 posts per feed_type.
+        """
+        url = "https://www.binance.com/bapi/socialmedia/v1/public/square/feed-recommend/list"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.binance.com/en/square/hot",
+            "Origin": "https://www.binance.com",
+        }
+        posts: list[dict] = []
+        cursor = ""
+
+        for _ in range(max_pages):
+            try:
+                body = {"type": feed_type, "cursor": cursor, "limit": 20}
+                r = await self._client.post(url, json=body, headers=headers, timeout=10.0)
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                vos = (data.get("data") or {}).get("vos") or []
+                if not vos:
+                    break
+                posts.extend(vos)
+                cursor = (data.get("data") or {}).get("cursor") or ""
+                if not cursor:
+                    break
+                await asyncio.sleep(0.4)   # gentle rate-limit
+            except Exception as e:
+                logger.debug(f"BS API paginate {feed_type}: {e}")
+                break
+
+        return posts
+
+    # ──────────────────────────────────────────────
+    # SOURCE 0: Binance Square — combined entry point
+    # ──────────────────────────────────────────────
+
+    async def fetch_binance_square(self) -> dict[str, dict]:
+        """
+        Scrape Binance Square với maximum coverage:
+
+        1. Playwright (6 tabs × pages_per_tab scrolls) — bypass Cloudflare
+        2. Direct API pagination (HOT + NEW feeds) — extra posts không giới hạn 20
+
+        Bot filter (Lana's method):
+          - Extract author.nickName per post
+          - Nếu username khớp default pattern (User123456, BN12345678, hex IDs...)
+            → đánh dấu là BOT, không đếm vào human_mentions
+          - Author post >6 lần trong 1 session → SPAM BOT, skip
+          - Chỉ human_mentions được dùng trong scoring
+
+        Returns:
+          { "BTC": {"mentions": 5, "human_mentions": 3, "bullish": 0, "bearish": 0} }
+        """
+        if not self.cfg.binance_square_enabled:
+            return {}
+
+        results: dict[str, dict] = defaultdict(
+            lambda: {"mentions": 0, "human_mentions": 0, "bullish": 0, "bearish": 0}
+        )
+        pages_per_tab = self.cfg.binance_square_pages_per_scene
+        all_posts: list[dict] = []
+        seen_ids: set[str] = set()
+
+        # ── 1. Playwright scrape (primary — bypass Cloudflare) ──
+        try:
+            pw_posts = await self._bs_playwright_scrape(pages_per_tab)
+            for post in pw_posts:
+                pid = post.get("id", "")
+                if pid and pid in seen_ids:
+                    continue
+                if pid:
+                    seen_ids.add(pid)
+                all_posts.append(post)
+            logger.debug(f"BS Playwright: {len(pw_posts)} posts ({len(seen_ids)} unique)")
         except ImportError:
-            logger.warning("Binance Square: playwright not installed, skipping")
+            logger.warning("Binance Square: playwright not installed — using API only")
         except Exception as e:
-            logger.warning(f"Binance Square fetch failed: {e}")
+            logger.warning(f"BS Playwright failed: {e}")
+
+        # ── 2. Direct API pagination (supplementary — cursor-based) ──
+        for feed_type in ("HOT", "NEW"):
+            try:
+                api_posts = await self._bs_api_paginate(feed_type=feed_type, max_pages=15)
+                added = 0
+                for post in api_posts:
+                    pid = post.get("id", "")
+                    if pid and pid in seen_ids:
+                        continue
+                    if pid:
+                        seen_ids.add(pid)
+                    all_posts.append(post)
+                    added += 1
+                logger.debug(f"BS API {feed_type}: +{added} new posts")
+            except Exception as e:
+                logger.debug(f"BS API {feed_type} failed: {e}")
+
+        # ── 3. Bot filter + ticker extraction ──
+        # Track per-author post count trong session này
+        author_post_counts: dict[str, int] = defaultdict(int)
+
+        # First pass: count posts per author
+        for post in all_posts:
+            author = post.get("author") or post.get("authorInfo") or {}
+            nick = (
+                author.get("nickName")
+                or author.get("nickname")
+                or author.get("name")
+                or ""
+            ).strip()
+            if nick:
+                author_post_counts[nick] += 1
+
+        # Second pass: extract tickers with bot filter
+        total_posts = len(all_posts)
+        human_posts = 0
+        bot_filtered = 0
+
+        for post in all_posts:
+            # Extract author nickname
+            author = post.get("author") or post.get("authorInfo") or {}
+            nick = (
+                author.get("nickName")
+                or author.get("nickname")
+                or author.get("name")
+                or ""
+            ).strip()
+
+            is_bot = self._is_likely_bot(nick, author_post_counts.get(nick, 0))
+
+            if is_bot:
+                bot_filtered += 1
+            else:
+                human_posts += 1
+
+            # Dedup tickers per post
+            post_tickers: set[str] = set()
+
+            # tradingPairs = tags chính xác
+            pairs = post.get("tradingPairs") or post.get("tradingPairsV2") or []
+            for pair in pairs:
+                code = (pair.get("code") or "").upper()
+                if code and code not in self.cfg.excluded_tickers:
+                    post_tickers.add(code)
+
+            # Scan title + content
+            text = f"{post.get('title') or ''} {post.get('content') or ''}"
+            if text.strip():
+                for ticker in TICKER_RE.findall(text):
+                    if ticker not in self.cfg.excluded_tickers and ticker not in _COMMON_WORDS:
+                        post_tickers.add(ticker)
+
+            for ticker in post_tickers:
+                results[ticker]["mentions"] += 1
+                if not is_bot:
+                    results[ticker]["human_mentions"] += 1
+
+        self._last_bs_posts = total_posts
+        self._last_bs_human_posts = human_posts
+        self._last_bs_bot_filtered = bot_filtered
+        self._last_bs_tickers = len(results)
+
+        logger.info(
+            f"Binance Square: {total_posts} posts total | "
+            f"{human_posts} human ✓ | {bot_filtered} bots filtered ✗ | "
+            f"{len(results)} tickers"
+        )
 
         return dict(results)
 
@@ -470,11 +673,15 @@ class SentimentScraper:
         if isinstance(fear_greed, dict):
             self._last_fg = fear_greed
 
-        # Merge Binance Square vào cp_data (boost mentions)
+        # Merge Binance Square vào cp_data
+        # Dùng human_mentions (bot-filtered) thay vì total mentions để scoring chính xác hơn
         for ticker, d in bs_data.items():
             if ticker not in cp_data:
                 cp_data[ticker] = {"mentions": 0, "bullish": 0, "bearish": 0}
-            cp_data[ticker]["mentions"] += d["mentions"]
+            # human_mentions = chỉ đếm posts từ human (đã filter bot ra)
+            # fallback sang total mentions nếu không có human_mentions field
+            human_m = d.get("human_mentions", d.get("mentions", 0))
+            cp_data[ticker]["mentions"] += human_m
 
         # Union tất cả tickers
         all_tickers = set(cp_data) | set(trending) | set(gainers) | set(bs_data)
@@ -544,6 +751,12 @@ class SentimentScraper:
                           ("DISABLED" if not bs_enabled else "NO_DATA"),
                 "last_update_age_s": _age(self._last_scan_ts),
                 "posts_scraped": self._last_bs_posts,
+                "human_posts": self._last_bs_human_posts,
+                "bot_filtered": self._last_bs_bot_filtered,
+                "bot_filter_rate": (
+                    round(self._last_bs_bot_filtered / self._last_bs_posts * 100, 1)
+                    if self._last_bs_posts > 0 else 0
+                ),
                 "tickers_found": self._last_bs_tickers,
             },
             "cryptopanic": {
