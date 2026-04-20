@@ -17,7 +17,8 @@ import logging
 import sys
 import math
 import json
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -89,6 +90,9 @@ class Bot:
         self.latest_sentiments: dict[str, SentimentScore] = {}
         self.latest_cattrades: dict[str, CattradeSignal] = {}
         self.latest_signals: list[TradeSignal] = []
+        # Signal history: giữ tất cả signals trong 4h gần nhất
+        # Tránh mất signal khi scan tiếp theo trả về [] (do cooldown)
+        self._signal_history: deque[TradeSignal] = deque(maxlen=100)
         self.latest_new_listing_setups: dict[str, NewListingSetup] = {}
         self.pending_approvals: dict[str, TradeSignal] = {}
         self.ws_clients: set[WebSocket] = set()
@@ -206,9 +210,25 @@ class Bot:
             account_balance=balance,
             current_prices=current_prices,
         )
-        
-        self.latest_signals = signals
-        await self._broadcast({"type": "signals", "data": [s.model_dump(mode="json") for s in signals]})
+
+        # Accumulate signals — không overwrite bằng [] khi cooldown
+        # Giữ history 4h, dedup theo (symbol, side)
+        if signals:
+            existing_keys = {(s.symbol, s.side.value) for s in self._signal_history}
+            for s in signals:
+                key = (s.symbol, s.side.value)
+                if key not in existing_keys:
+                    self._signal_history.append(s)
+                    existing_keys.add(key)
+            logger.info(f"New signals: {len(signals)} | History: {len(self._signal_history)}")
+
+        # Prune signals cũ hơn 4h
+        cutoff = datetime.utcnow() - timedelta(hours=4)
+        while self._signal_history and self._signal_history[0].timestamp < cutoff:
+            self._signal_history.popleft()
+
+        self.latest_signals = list(self._signal_history)
+        await self._broadcast({"type": "signals", "data": [s.model_dump(mode="json") for s in self.latest_signals]})
         
         for signal in signals:
             await self._process_signal(signal)
