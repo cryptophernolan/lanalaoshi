@@ -155,10 +155,20 @@ class SentimentScraper:
         all_posts: list[dict] = []
         seen_ids: set[str] = set()
 
+        # Load stealth helper nếu có (ẩn dấu hiệu headless Chromium)
+        try:
+            from playwright_stealth import stealth_async as _stealth_fn
+        except ImportError:
+            _stealth_fn = None
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             context = await browser.new_context(
                 user_agent=(
@@ -167,10 +177,19 @@ class SentimentScraper:
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 locale="en-US",
+                viewport={"width": 1280, "height": 900},
             )
 
             for tab_url in tabs:
                 page = await context.new_page()
+
+                # Stealth: ẩn navigator.webdriver, plugins, etc.
+                if _stealth_fn:
+                    try:
+                        await _stealth_fn(page)
+                    except Exception:
+                        pass
+
                 tab_posts: list[dict] = []
 
                 async def on_feed_response(resp, _tab_posts=tab_posts):
@@ -186,11 +205,11 @@ class SentimentScraper:
 
                 try:
                     await page.goto(tab_url, wait_until="domcontentloaded", timeout=30_000)
-                    await asyncio.sleep(2)  # đợi batch đầu tiên
+                    await asyncio.sleep(3)  # đợi Cloudflare challenge pass
 
                     for _ in range(pages_per_tab - 1):
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await asyncio.sleep(1.2)
+                        await asyncio.sleep(1.5)
 
                 except Exception as e:
                     logger.debug(f"BS Playwright tab {tab_url}: {e}")
@@ -211,51 +230,61 @@ class SentimentScraper:
         return all_posts
 
     # ──────────────────────────────────────────────
-    # SOURCE 0b: Binance Square Direct API pagination
+    # SOURCE 0b: Binance Square Direct API (curl_cffi — bypass Cloudflare)
     # ──────────────────────────────────────────────
 
     async def _bs_api_paginate(
         self, feed_type: str = "HOT", max_pages: int = 15
     ) -> list[dict]:
         """
-        Direct POST pagination to Binance Square feed-recommend/list API.
-        Không cần Playwright — gọi thẳng endpoint với cursor pagination.
-        Bypasses the "only 20 posts" limit bằng cách follow cursor.
+        Direct POST pagination tới Binance Square feed-recommend/list API.
+        Dùng curl_cffi để impersonate TLS fingerprint của Chrome thật →
+        bypass Cloudflare 403/202 challenge mà httpx bình thường bị chặn.
 
-        Thường trả về thêm 100-300 posts per feed_type.
+        Cursor pagination: mỗi response trả về cursor cho trang tiếp theo.
+        max_pages × 20 posts/page → tối đa 300 posts per feed_type.
         """
         url = "https://www.binance.com/bapi/socialmedia/v1/public/square/feed-recommend/list"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.binance.com/en/square/hot",
-            "Origin": "https://www.binance.com",
-        }
         posts: list[dict] = []
         cursor = ""
 
-        for _ in range(max_pages):
-            try:
-                body = {"type": feed_type, "cursor": cursor, "limit": 20}
-                r = await self._client.post(url, json=body, headers=headers, timeout=10.0)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                vos = (data.get("data") or {}).get("vos") or []
-                if not vos:
-                    break
-                posts.extend(vos)
-                cursor = (data.get("data") or {}).get("cursor") or ""
-                if not cursor:
-                    break
-                await asyncio.sleep(0.4)   # gentle rate-limit
-            except Exception as e:
-                logger.debug(f"BS API paginate {feed_type}: {e}")
-                break
+        try:
+            from curl_cffi.requests import AsyncSession
+
+            async with AsyncSession(impersonate="chrome124") as session:
+                for _ in range(max_pages):
+                    try:
+                        resp = await session.post(
+                            url,
+                            json={"type": feed_type, "cursor": cursor, "limit": 20},
+                            headers={
+                                "Content-Type": "application/json",
+                                "Accept": "application/json, text/plain, */*",
+                                "Referer": "https://www.binance.com/en/square/hot",
+                                "Origin": "https://www.binance.com",
+                            },
+                            timeout=12,
+                        )
+                        if resp.status_code != 200:
+                            logger.debug(f"BS API {feed_type}: HTTP {resp.status_code}")
+                            break
+                        data = resp.json()
+                        vos = (data.get("data") or {}).get("vos") or []
+                        if not vos:
+                            break
+                        posts.extend(vos)
+                        cursor = (data.get("data") or {}).get("cursor") or ""
+                        if not cursor:
+                            break
+                        await asyncio.sleep(0.4)
+                    except Exception as e:
+                        logger.debug(f"BS API paginate {feed_type} page: {e}")
+                        break
+
+        except ImportError:
+            logger.debug("curl_cffi not available — skipping direct API pagination")
+        except Exception as e:
+            logger.debug(f"BS API paginate {feed_type}: {e}")
 
         return posts
 
