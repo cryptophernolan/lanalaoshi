@@ -88,8 +88,14 @@ class SentimentScraper:
         self._last_fg: Optional[dict] = None
         self._last_trending_count: int = 0
         self._last_gainers_count: int = 0
+        self._last_cmc_count: int = 0
         self._last_error: Optional[str] = None
         self._using_reddit_fallback: bool = False
+        # Circuit breaker cho Binance Square (auto-skip khi bị block)
+        self._bs_fail_count: int = 0
+        self._bs_circuit_open_until: float = 0.0
+        self._BS_FAIL_THRESHOLD = 3       # mở circuit sau 3 lần fail liên tiếp
+        self._BS_CIRCUIT_COOLDOWN = 600   # đóng lại sau 10 phút
 
     # ──────────────────────────────────────────────
     # Bot detection helper (Lana's method)
@@ -312,6 +318,14 @@ class SentimentScraper:
         if not self.cfg.binance_square_enabled:
             return {}
 
+        # ── Circuit breaker: skip nếu đang bị block ──
+        import time as _time
+        now_ts = _time.time()
+        if now_ts < self._bs_circuit_open_until:
+            remaining = int(self._bs_circuit_open_until - now_ts)
+            logger.info(f"Binance Square: circuit open, skipping ({remaining}s remaining)")
+            return {}
+
         results: dict[str, dict] = defaultdict(
             lambda: {"mentions": 0, "human_mentions": 0, "bullish": 0, "bearish": 0}
         )
@@ -416,6 +430,19 @@ class SentimentScraper:
         self._last_bs_human_posts = human_posts
         self._last_bs_bot_filtered = bot_filtered
         self._last_bs_tickers = len(results)
+
+        # Circuit breaker: reset hoặc mở nếu không lấy được gì
+        if total_posts == 0:
+            self._bs_fail_count += 1
+            if self._bs_fail_count >= self._BS_FAIL_THRESHOLD:
+                import time as _t2
+                self._bs_circuit_open_until = _t2.time() + self._BS_CIRCUIT_COOLDOWN
+                logger.warning(
+                    f"Binance Square: {self._bs_fail_count} consecutive failures — "
+                    f"circuit opened for {self._BS_CIRCUIT_COOLDOWN}s (likely IP block)"
+                )
+        else:
+            self._bs_fail_count = 0  # reset on success
 
         logger.info(
             f"Binance Square: {total_posts} posts total | "
@@ -537,6 +564,39 @@ class SentimentScraper:
             return {}
 
     # ──────────────────────────────────────────────
+    # SOURCE 3b: CoinMarketCap Trending (thay thế Binance Square khi bị block)
+    # ──────────────────────────────────────────────
+
+    async def fetch_cmc_trending(self) -> dict[str, int]:
+        """
+        CoinMarketCap top-searched coins — không cần API key.
+        Endpoint public, không bị WAF chặn.
+
+        Trả về: { "BTC": 1, "ETH": 2, ... } (rank 1 = most searched)
+
+        Dùng để bổ sung khi Binance Square bị block — cho biết
+        coin nào đang được search nhiều nhất (tương đương "hot topic").
+        """
+        try:
+            r = await self._client.get(
+                "https://api.coinmarketcap.com/data-api/v3/topsearch/rank",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            coins = r.json().get("data", {}).get("cryptoTopSearchRanks", [])
+            trending: dict[str, int] = {}
+            for rank, item in enumerate(coins, start=1):
+                symbol = (item.get("symbol") or "").upper()
+                if symbol and symbol not in self.cfg.excluded_tickers:
+                    trending[symbol] = rank
+            logger.info(f"CMC trending: {len(trending)} tickers")
+            return trending
+        except Exception as e:
+            logger.warning(f"CMC trending failed: {e}")
+            return {}
+
+    # ──────────────────────────────────────────────
     # SOURCE 2b: Reddit (fallback khi không có CryptoPanic key)
     # ──────────────────────────────────────────────
 
@@ -605,19 +665,21 @@ class SentimentScraper:
         gainers_rank: Optional[int],
         trending_rank: Optional[int],
         fear_greed: Optional[dict],
+        cmc_rank: Optional[int] = None,
     ) -> float:
         """
         Composite sentiment score 0-100 cho 1 ticker.
 
         Weights (sum ~1.0):
-          CryptoPanic mentions+sentiment : 0.45
-          Binance Gainers rank           : 0.25
-          CoinGecko Trending rank        : 0.15
-          Fear & Greed market bias       : 0.15
+          CryptoPanic/Reddit mentions+sentiment : 0.40
+          Binance Gainers rank                  : 0.25
+          CoinGecko Trending rank               : 0.12
+          CMC Top Searched rank                 : 0.08  ← thay thế khi BS bị block
+          Fear & Greed market bias              : 0.15
         """
         score = 0.0
 
-        # ── CryptoPanic (0–100 component) ──
+        # ── CryptoPanic/Reddit (0–100 component) ──
         mentions = cp_data.get("mentions", 0)
         bullish = cp_data.get("bullish", 0)
         bearish = cp_data.get("bearish", 0)
@@ -626,7 +688,6 @@ class SentimentScraper:
             mention_score = min(math.log(mentions + 1) * 20, 100)
             total_votes = bullish + bearish
             sentiment_ratio = (bullish / total_votes) if total_votes > 0 else 0.5
-            # sentiment_ratio 0.5 = neutral, 1.0 = all bullish
             sentiment_boost = (sentiment_ratio - 0.5) * 40  # -20 to +20
             cp_score = min(max(mention_score + sentiment_boost, 0), 100)
             score += cp_score * self.cfg.cryptopanic_weight
@@ -641,17 +702,20 @@ class SentimentScraper:
             trending_score = max(0, 100 - trending_rank * 10)
             score += trending_score * self.cfg.coingecko_weight
 
+        # ── CoinMarketCap Top Searched rank (rank 1 = most searched) ──
+        # Bổ sung khi Binance Square bị block, weight nhỏ hơn CoinGecko
+        if cmc_rank is not None:
+            cmc_score = max(0, 100 - cmc_rank * 10)   # top-10 coins max score
+            score += cmc_score * 0.08
+
         # ── Fear & Greed — global market bias ──
-        # Extreme Fear (< 25) → thị trường sợ hãi, dễ bounce → bullish bias nhẹ
-        # Extreme Greed (> 75) → thị trường tham lam, dễ dump → bearish bias nhẹ
-        # Neutral zone (25-75) → không ảnh hưởng nhiều
         if fear_greed is not None:
             fg_val = fear_greed["value"]
-            if fg_val <= 25:       # Extreme Fear → contrarian bullish
+            if fg_val <= 25:
                 fg_score = 70
-            elif fg_val >= 75:     # Extreme Greed → contrarian bearish (lower score)
+            elif fg_val >= 75:
                 fg_score = 30
-            else:                  # Neutral zone
+            else:
                 fg_score = 50
             score += fg_score * self.cfg.fear_greed_weight
 
@@ -670,9 +734,10 @@ class SentimentScraper:
         trending_task = self.fetch_coingecko_trending()
         gainers_task = self.fetch_binance_gainers()
         bs_task = self.fetch_binance_square()
+        cmc_task = self.fetch_cmc_trending()
 
-        cp_data, fear_greed, trending, gainers, bs_data = await asyncio.gather(
-            cp_task, fg_task, trending_task, gainers_task, bs_task,
+        cp_data, fear_greed, trending, gainers, bs_data, cmc_trending = await asyncio.gather(
+            cp_task, fg_task, trending_task, gainers_task, bs_task, cmc_task,
             return_exceptions=True,
         )
 
@@ -689,6 +754,8 @@ class SentimentScraper:
         if isinstance(bs_data, Exception):
             logger.warning(f"Binance Square gather error: {bs_data}")
             bs_data = {}
+        if isinstance(cmc_trending, Exception):
+            cmc_trending = {}
 
         # Track per-source counts
         if use_reddit:
@@ -699,21 +766,19 @@ class SentimentScraper:
             self._last_reddit_tickers = 0
         self._last_trending_count = len(trending) if isinstance(trending, dict) else 0
         self._last_gainers_count = len(gainers) if isinstance(gainers, dict) else 0
+        self._last_cmc_count = len(cmc_trending) if isinstance(cmc_trending, dict) else 0
         if isinstance(fear_greed, dict):
             self._last_fg = fear_greed
 
-        # Merge Binance Square vào cp_data
-        # Dùng human_mentions (bot-filtered) thay vì total mentions để scoring chính xác hơn
+        # Merge Binance Square vào cp_data (human_mentions only — bot filtered)
         for ticker, d in bs_data.items():
             if ticker not in cp_data:
                 cp_data[ticker] = {"mentions": 0, "bullish": 0, "bearish": 0}
-            # human_mentions = chỉ đếm posts từ human (đã filter bot ra)
-            # fallback sang total mentions nếu không có human_mentions field
             human_m = d.get("human_mentions", d.get("mentions", 0))
             cp_data[ticker]["mentions"] += human_m
 
-        # Union tất cả tickers
-        all_tickers = set(cp_data) | set(trending) | set(gainers) | set(bs_data)
+        # Union tất cả tickers (thêm cmc_trending)
+        all_tickers = set(cp_data) | set(trending) | set(gainers) | set(bs_data) | set(cmc_trending)
 
         scores: dict[str, SentimentScore] = {}
         now = datetime.utcnow()
@@ -728,6 +793,7 @@ class SentimentScraper:
                 gainers_rank=gainers.get(ticker),
                 trending_rank=trending.get(ticker),
                 fear_greed=fear_greed if not isinstance(fear_greed, Exception) else None,
+                cmc_rank=cmc_trending.get(ticker) if isinstance(cmc_trending, dict) else None,
             )
 
             if composite < 8:
@@ -823,6 +889,13 @@ class SentimentScraper:
                 "status": "OK" if self._last_gainers_count > 0 else "NO_DATA",
                 "last_update_age_s": _age(self._last_scan_ts),
                 "tickers_found": self._last_gainers_count,
+            },
+            "coinmarketcap_trending": {
+                "enabled": True,
+                "status": "OK" if self._last_cmc_count > 0 else "NO_DATA",
+                "last_update_age_s": _age(self._last_scan_ts),
+                "tickers_found": self._last_cmc_count,
+                "note": "Replaces Binance Square when IP-blocked",
             },
             "last_error": self._last_error,
             "total_scored_tickers": len(self._last_scores),
