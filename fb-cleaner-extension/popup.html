@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; width: 340px; margin: 0; padding: 12px; color: #111; }
+  h1 { font-size: 15px; margin: 0 0 6px; }
+  .warn { background: #fef3c7; border: 1px solid #f59e0b; padding: 6px 8px; border-radius: 6px; margin-bottom: 8px; }
+  .err { background: #fee2e2; border-color: #ef4444; }
+  label { display: flex; justify-content: space-between; align-items: center; margin: 4px 0; gap: 8px; }
+  input[type=number] { width: 70px; }
+  .row { display: flex; gap: 6px; margin: 8px 0; }
+  button { flex: 1; padding: 7px; border-radius: 6px; border: 1px solid #999; cursor: pointer; background: #fff; }
+  #start { background: #1877f2; color: #fff; border-color: #1877f2; }
+  #stop { background: #ef4444; color: #fff; border-color: #ef4444; }
+  #log { height: 140px; overflow: auto; background: #f3f4f6; font: 11px ui-monospace, monospace; padding: 6px; border-radius: 6px; white-space: pre-wrap; }
+  #stats { font-weight: 600; margin: 4px 0; }
+  a { color: #1877f2; }
+</style>
+</head>
+<body>
+  <h1>FB Activity Cleaner</h1>
+  <div class="warn">Chỉ xoá nội dung <b>của chính bạn</b>. Xoá là <b>không hoàn tác</b> (trừ mục trong Thùng rác 30 ngày). Nên chạy DRY-RUN trước.</div>
+  <div id="notice" class="warn err" hidden></div>
+  <p>1. Đăng nhập Facebook như bình thường.<br>
+     2. Mở <a href="#" id="openLog">Nhật ký hoạt động</a>, chọn bộ lọc (Bài viết của bạn / Bình luận / Nhóm…).<br>
+     3. Bấm Start.</p>
+
+  <label>Dry-run (chỉ đánh dấu, không xoá) <input type="checkbox" id="dryRun" checked></label>
+  <label>Gỡ tag mình trong bài người khác <input type="checkbox" id="removeTags"></label>
+  <label>Bỏ like / cảm xúc <input type="checkbox" id="removeReactions"></label>
+  <label>Nghỉ giữa 2 mục (giây, min–max) <span><input type="number" id="minDelaySec" min="3"> – <input type="number" id="maxDelaySec" min="3"></span></label>
+  <label>Nghỉ dài sau mỗi N mục <input type="number" id="batchSize" min="1"></label>
+  <label>Thời gian nghỉ dài (giây) <input type="number" id="batchPauseSec" min="60"></label>
+  <label>Tối đa mỗi phiên <input type="number" id="maxPerSession" min="1" max="500"></label>
+
+  <div class="row"><button id="start">Start</button><button id="stop">Stop</button></div>
+  <div id="stats"></div>
+  <div id="log"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

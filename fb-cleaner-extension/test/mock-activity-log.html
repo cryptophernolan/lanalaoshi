@@ -1,0 +1,70 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Mock Activity Log</title>
+<style>.item{border:1px solid #ccc;margin:6px;padding:8px;height:40px}
+[role=menu],[role=dialog]{position:fixed;top:40px;left:40px;background:#fff;border:1px solid #000;padding:8px}
+[role=button],[role=menuitem]{display:inline-block;padding:4px;border:1px solid #888;margin:2px;cursor:pointer}</style>
+</head><body>
+<div id="list"></div>
+<script>
+// Simulated Facebook behaviour. Virtual clock is advanced by the test harness (window.__vclock).
+window.__vclock = 0;
+window.__deleted = [];
+window.__deleteTimes = [];
+window.__rateRule = { windowMs: 30000, maxInWindow: 4 }; // >4 deletes in 30s => "temporarily blocked"
+const list = document.getElementById('list');
+function addItem(id, kind) {
+  const d = document.createElement('div');
+  d.className = 'item'; d.dataset.id = id; d.dataset.kind = kind;
+  d.textContent = kind + ' #' + id + ' ';
+  const b = document.createElement('div');
+  b.setAttribute('role', 'button'); b.setAttribute('aria-label', id % 2 ? 'Action options' : 'Tùy chọn hành động');
+  b.textContent = '...';
+  b.onclick = () => openMenu(d);
+  d.appendChild(b); list.appendChild(d);
+}
+let n = 0;
+function loadMore(k) { for (let i = 0; i < k; i++) { n++; addItem(n, n % 7 === 0 ? 'friend-post-no-delete' : (n % 3 ? 'my-post' : 'my-comment-in-group')); } }
+loadMore(10);
+window.__totalItems = 25;
+window.addEventListener('scroll', () => {});
+const origScroll = window.scrollTo.bind(window);
+window.scrollTo = (x, y) => { if (n < window.__totalItems) loadMore(Math.min(5, window.__totalItems - n)); origScroll(x, y); };
+
+function closeAll() { document.querySelectorAll('[role=menu],[role=dialog]').forEach(e => e.remove()); }
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeAll(); });
+
+function openMenu(item) {
+  closeAll();
+  const m = document.createElement('div'); m.setAttribute('role', 'menu');
+  const mk = (txt, fn) => { const x = document.createElement('div'); x.setAttribute('role','menuitem'); x.textContent = txt; x.onclick = fn; m.appendChild(x); };
+  mk('Hide from profile', () => closeAll());
+  if (item.dataset.kind !== 'friend-post-no-delete') {
+    mk(item.dataset.id % 2 ? 'Move to trash' : 'Xóa', () => { closeAll(); openConfirm(item); });
+  }
+  document.body.appendChild(m);
+}
+function openConfirm(item) {
+  const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+  d.innerHTML = '<p>Are you sure?</p>';
+  const c = document.createElement('div'); c.setAttribute('role','button'); c.textContent = 'Cancel'; c.onclick = closeAll;
+  const ok = document.createElement('div'); ok.setAttribute('role','button'); ok.textContent = item.dataset.id % 2 ? 'Move' : 'Xóa';
+  ok.onclick = () => { closeAll(); doDelete(item); };
+  d.append(c, ok); document.body.appendChild(d);
+}
+function doDelete(item) {
+  const now = window.__vclock;
+  window.__deleteTimes = window.__deleteTimes.filter(t => now - t < window.__rateRule.windowMs);
+  if (window.__deleteTimes.length >= window.__rateRule.maxInWindow) {
+    const d = document.createElement('div'); d.setAttribute('role', 'dialog');
+    d.textContent = "You're Temporarily Blocked. It looks like you were misusing this feature by going too fast.";
+    document.body.appendChild(d);
+    window.__blockedShown = true;
+    return;
+  }
+  window.__deleteTimes.push(now);
+  window.__deleted.push(item.dataset.id);
+  item.remove();
+}
+</script>
+<script src="../cleaner.js"></script>
+</body></html>

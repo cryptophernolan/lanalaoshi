@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "FB Activity Cleaner",
+  "version": "1.0.0",
+  "description": "Xoá bài viết / bình luận CỦA CHÍNH BẠN qua Nhật ký hoạt động Facebook, có giới hạn tốc độ và tự dừng khi Facebook cảnh báo.",
+  "permissions": ["storage", "activeTab", "tabs"],
+  "host_permissions": ["https://www.facebook.com/*"],
+  "action": { "default_popup": "popup.html", "default_title": "FB Activity Cleaner" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.facebook.com/*"],
+      "js": ["cleaner.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
